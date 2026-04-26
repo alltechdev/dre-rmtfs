@@ -8,7 +8,7 @@
 #ifndef ANDROID
 #include <libudev.h>
 #else
-#include <sys/endian.h>
+#include <endian.h>
 #endif
 #include <stdbool.h>
 #include <stdio.h>
@@ -257,10 +257,106 @@ err_close_fd:
 	return -saved_errno;
 }
 
+/* Downstream Qualcomm kernels expose the rmtfs region via the UIO subsystem
+ * (drivers/soc/qcom/msm_sharedmem.c) at /dev/uioN, not /dev/qcom_rmtfs_mem%d.
+ * Walk /sys/class/uio/uio*, find the one named "rmtfs", read its map0 addr+size
+ * directly from sysfs (no libudev), and mmap it.
+ */
+static int read_hex_file(const char *path, uint64_t *out)
+{
+	char buf[64];
+	int fd, n;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -errno;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return -EIO;
+	buf[n] = 0;
+	*out = strtoull(buf, NULL, 16);
+	return 0;
+}
+
+static int read_str_file(const char *path, char *buf, size_t buflen)
+{
+	int fd, n;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -errno;
+	n = read(fd, buf, buflen - 1);
+	close(fd);
+	if (n <= 0)
+		return -EIO;
+	buf[n] = 0;
+	while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == ' '))
+		buf[--n] = 0;
+	return 0;
+}
+
 static int rmtfs_mem_open_uio(struct rmtfs_mem *rmem, int client_id)
 {
-	fprintf(stderr, "uio access is not supported on ANDROID yet\n");
-	return -EINVAL;
+	DIR *d;
+	struct dirent *de;
+	char path[PATH_MAX];
+	char name[64];
+	int fd = -1, ret;
+
+	d = opendir("/sys/class/uio");
+	if (!d) {
+		fprintf(stderr, "uio: cannot open /sys/class/uio: %s\n", strerror(errno));
+		return -errno;
+	}
+	while ((de = readdir(d)) != NULL) {
+		if (strncmp(de->d_name, "uio", 3) != 0)
+			continue;
+		snprintf(path, sizeof(path), "/sys/class/uio/%s/name", de->d_name);
+		if (read_str_file(path, name, sizeof(name)) < 0)
+			continue;
+		if (strcmp(name, "rmtfs") != 0)
+			continue;
+
+		snprintf(path, sizeof(path), "/dev/%s", de->d_name);
+		fd = open(path, O_RDWR);
+		if (fd < 0) {
+			fprintf(stderr, "uio: open %s: %s\n", path, strerror(errno));
+			closedir(d);
+			return -errno;
+		}
+		rmem->fd = fd;
+
+		snprintf(path, sizeof(path), "/sys/class/uio/%s/maps/map0/addr", de->d_name);
+		ret = read_hex_file(path, &rmem->address);
+		if (ret < 0)
+			goto err;
+
+		snprintf(path, sizeof(path), "/sys/class/uio/%s/maps/map0/size", de->d_name);
+		ret = read_hex_file(path, &rmem->size);
+		if (ret < 0)
+			goto err;
+
+		rmem->base = mmap(0, rmem->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		if (rmem->base == MAP_FAILED) {
+			fprintf(stderr, "uio: mmap failed: %s\n", strerror(errno));
+			ret = -errno;
+			goto err;
+		}
+		fprintf(stderr, "uio: %s addr=0x%llx size=0x%llx\n", de->d_name,
+			(unsigned long long)rmem->address,
+			(unsigned long long)rmem->size);
+		closedir(d);
+		return 0;
+	}
+	closedir(d);
+	return -ENOENT;
+
+err:
+	if (fd >= 0)
+		close(fd);
+	closedir(d);
+	return ret;
 }
 
 #endif
