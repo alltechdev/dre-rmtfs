@@ -44,6 +44,14 @@ static const struct partition partition_table[] = {
 	{ "/boot/modem_study", "modem_study", "study" },
 	{ "/boot/modem_tunning", "modem_tunning", "tunning" },
 	{ "/boot/modem_tng", "modem_tng", "tunning" },
+	/* Droidspaces: OnePlus dre modem firmware additionally probes
+	 * /oem/nvbk/{static,dynamic} as plain backup files. Without them
+	 * modem stays in a limp mode where wlan_pd PD remains UNINIT.
+	 * Map them to plain files inside the storage_root (or via partlabel
+	 * when -P is passed; we use a writable file fallback below).
+	 */
+	{ "/oem/nvbk/static",  "oem_nvbk_static",  "oem_nvbk_static" },
+	{ "/oem/nvbk/dynamic", "oem_nvbk_dynamic", "oem_nvbk_dynamic" },
 	{}
 };
 
@@ -146,6 +154,24 @@ found:
 		file = part->partlabel;
 	else
 		file = part->actual;
+
+	/* Droidspaces: /oem/nvbk/* always live as plain files even with -P
+	 * since they're not GPT partitions on dre. Route to /linux/rmtfs-files/.
+	 */
+	if (!strncmp(path, "/oem/nvbk/", 10)) {
+		pathlen = strlen("/linux/rmtfs-files/") + strlen(file) + 2;
+		fspath = alloca(pathlen);
+		snprintf(fspath, pathlen, "/linux/rmtfs-files/%s", file);
+		mkdir("/linux/rmtfs-files", 0700);
+		/* create empty if missing so first open()/RDWR succeeds */
+		int cf = open(fspath, O_CREAT | O_RDWR, 0600);
+		if (cf >= 0) close(cf);
+		ret = fd_open(rmtfd, fspath, part);
+		if (ret) return NULL;
+		rmtfd->node = node;
+		rmtfd->partition = part;
+		return rmtfd;
+	}
 
 	pathlen = strlen(storage_dir) + strlen(file) + 2 + strnlen(slot_suffix, SLOT_SUFFIX_LEN);
 	fspath = alloca(pathlen);
